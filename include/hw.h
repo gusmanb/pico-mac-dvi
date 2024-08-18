@@ -29,9 +29,13 @@
 
 #define GPIO_LED_PIN    PICO_DEFAULT_LED_PIN
 
+#if PICO_RP2350
+#define GPIO_VID_DATA   21
+#else
 #define GPIO_VID_DATA   18
-#define GPIO_VID_VS     19
-#define GPIO_VID_CLK    20
-#define GPIO_VID_HS     21
+#endif
+#define GPIO_VID_VS     (GPIO_VID_DATA + 1)
+#define GPIO_VID_CLK    (GPIO_VID_VS + 1)
+#define GPIO_VID_HS     (GPIO_VID_CLK + 1)
 
 #endif
