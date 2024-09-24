@@ -1,345 +1,118 @@
-/* Video output:
- *
- * Using PIO[1], output the Mac 512x342 1BPP framebuffer to VGA/pins.  This is done
- * directly from the Mac framebuffer (without having to reformat in an intermediate
- * buffer).  The video output is 640x480, with the visible pixel data centred with
- * borders:  for analog VGA this is easy, as it just means increasing the horizontal
- * back porch/front porch (time between syncs and active video) and reducing the
- * display portion of a line.
- *
- * [1]: see pio_video.pio
- *
- * Copyright 2024 Matt Evans
- *
- * Permission is hereby granted, free of charge, to any person
- * obtaining a copy of this software and associated documentation files
- * (the "Software"), to deal in the Software without restriction,
- * including without limitation the rights to use, copy, modify, merge,
- * publish, distribute, sublicense, and/or sell copies of the Software,
- * and to permit persons to whom the Software is furnished to do so,
- * subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be
- * included in all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
-
-#include <stdio.h>
-#include <inttypes.h>
 #include <string.h>
+#include <stdio.h>
+#include <unistd.h>
+
+#include "dvi.h"
+#include "dvi_serialiser.h"
+#include "common_dvi_pin_configs.h"
+#include "tmds_encode.h"
+#include "hardware/structs/bus_ctrl.h"
+#include "hardware/vreg.h"
+#include "hardware/irq.h"
 #include "hardware/clocks.h"
-#include "hardware/dma.h"
-#include "hardware/gpio.h"
-#include "hardware/structs/padsbank0.h"
-#include "pio_video.pio.h"
-
-#include "hw.h"
-
-////////////////////////////////////////////////////////////////////////////////
-/* VESA VGA mode 640x480@60 */
-
-/* The pixel clock _should_ be (125/2/25.175) (about 2.483) but that seems to
- * make my VGA-HDMI adapter sample weird, and pixels crawl.  Fudge a little,
- * looks better:
- */
-#define VIDEO_PCLK_MULT         (2.5*2)
-#define VIDEO_HSW               96
-#define VIDEO_HBP               48
-#define VIDEO_HRES              640
-#define VIDEO_HFP               16
-#define VIDEO_H_TOTAL_NOSYNC    (VIDEO_HBP + VIDEO_HRES + VIDEO_HFP)
-#define VIDEO_VSW               2
-#define VIDEO_VBP               33
-#define VIDEO_VRES              480
-#define VIDEO_VFP               10
-#define VIDEO_V_TOTAL           (VIDEO_VSW + VIDEO_VBP + VIDEO_VRES + VIDEO_VFP)
-/* The visible vertical span in the VGA output, [start, end) lines: */
-#define VIDEO_V_VIS_START       (VIDEO_VSW + VIDEO_VBP)
-#define VIDEO_V_VIS_END         (VIDEO_V_VIS_START + VIDEO_VRES)
 
 #define VIDEO_FB_HRES           512
 #define VIDEO_FB_VRES           342
 
-/* The lines at which the FB data is actively output: */
-#define VIDEO_FB_V_VIS_START    (VIDEO_V_VIS_START + ((VIDEO_VRES - VIDEO_FB_VRES)/2))
-#define VIDEO_FB_V_VIS_END      (VIDEO_FB_V_VIS_START + VIDEO_FB_VRES)
+#define FIRST_LINE (((FRAME_HEIGHT - VIDEO_FB_VRES) / 2) - 1)
+#define LAST_LINE ((FIRST_LINE + VIDEO_FB_VRES) + 1)
+#define HORIZONTAL_OFFSET ((FRAME_WIDTH - VIDEO_FB_HRES) / 16)
 
-/* Words of 1BPP pixel data per line; this dictates the length of the
- * video data DMA transfer:
- */
-#define VIDEO_VISIBLE_WPL       (VIDEO_FB_HRES / 32)
+#define STRIDE (VIDEO_FB_HRES / 8)
+#define FRAME_WIDTH 640
+#define FRAME_HEIGHT 480
+#define DVI_TIMING dvi_timing_640x480p_60hz
+#define VREG_VSEL VREG_VOLTAGE_1_20
 
-#if (VIDEO_HRES & 31)
-#error "VIDEO_HRES: must be a multiple of 32b!"
-#endif
+uint8_t* fb = NULL;
 
-////////////////////////////////////////////////////////////////////////////////
-// Video DMA, framebuffer pointers
+struct dvi_inst dvi0;
 
-static uint32_t video_null[VIDEO_VISIBLE_WPL];
-static uint32_t *video_framebuffer;
 
-/* DMA buffer containing 2 pairs of per-line config words, for VS and not-VS: */
-static uint32_t video_dma_cfg[4];
+unsigned char table[] = {
+        0x00 ^ 0xFF, 0x80 ^ 0xFF, 0x40 ^ 0xFF, 0xc0 ^ 0xFF, 0x20 ^ 0xFF, 0xa0 ^ 0xFF, 0x60 ^ 0xFF, 0xe0 ^ 0xFF,
+        0x10 ^ 0xFF, 0x90 ^ 0xFF, 0x50 ^ 0xFF, 0xd0 ^ 0xFF, 0x30 ^ 0xFF, 0xb0 ^ 0xFF, 0x70 ^ 0xFF, 0xf0 ^ 0xFF,
+        0x08 ^ 0xFF, 0x88 ^ 0xFF, 0x48 ^ 0xFF, 0xc8 ^ 0xFF, 0x28 ^ 0xFF, 0xa8 ^ 0xFF, 0x68 ^ 0xFF, 0xe8 ^ 0xFF,
+        0x18 ^ 0xFF, 0x98 ^ 0xFF, 0x58 ^ 0xFF, 0xd8 ^ 0xFF, 0x38 ^ 0xFF, 0xb8 ^ 0xFF, 0x78 ^ 0xFF, 0xf8 ^ 0xFF,
+        0x04 ^ 0xFF, 0x84 ^ 0xFF, 0x44 ^ 0xFF, 0xc4 ^ 0xFF, 0x24 ^ 0xFF, 0xa4 ^ 0xFF, 0x64 ^ 0xFF, 0xe4 ^ 0xFF,
+        0x14 ^ 0xFF, 0x94 ^ 0xFF, 0x54 ^ 0xFF, 0xd4 ^ 0xFF, 0x34 ^ 0xFF, 0xb4 ^ 0xFF, 0x74 ^ 0xFF, 0xf4 ^ 0xFF,
+        0x0c ^ 0xFF, 0x8c ^ 0xFF, 0x4c ^ 0xFF, 0xcc ^ 0xFF, 0x2c ^ 0xFF, 0xac ^ 0xFF, 0x6c ^ 0xFF, 0xec ^ 0xFF,
+        0x1c ^ 0xFF, 0x9c ^ 0xFF, 0x5c ^ 0xFF, 0xdc ^ 0xFF, 0x3c ^ 0xFF, 0xbc ^ 0xFF, 0x7c ^ 0xFF, 0xfc ^ 0xFF,
+        0x02 ^ 0xFF, 0x82 ^ 0xFF, 0x42 ^ 0xFF, 0xc2 ^ 0xFF, 0x22 ^ 0xFF, 0xa2 ^ 0xFF, 0x62 ^ 0xFF, 0xe2 ^ 0xFF,
+        0x12 ^ 0xFF, 0x92 ^ 0xFF, 0x52 ^ 0xFF, 0xd2 ^ 0xFF, 0x32 ^ 0xFF, 0xb2 ^ 0xFF, 0x72 ^ 0xFF, 0xf2 ^ 0xFF,
+        0x0a ^ 0xFF, 0x8a ^ 0xFF, 0x4a ^ 0xFF, 0xca ^ 0xFF, 0x2a ^ 0xFF, 0xaa ^ 0xFF, 0x6a ^ 0xFF, 0xea ^ 0xFF,
+        0x1a ^ 0xFF, 0x9a ^ 0xFF, 0x5a ^ 0xFF, 0xda ^ 0xFF, 0x3a ^ 0xFF, 0xba ^ 0xFF, 0x7a ^ 0xFF, 0xfa ^ 0xFF,
+        0x06 ^ 0xFF, 0x86 ^ 0xFF, 0x46 ^ 0xFF, 0xc6 ^ 0xFF, 0x26 ^ 0xFF, 0xa6 ^ 0xFF, 0x66 ^ 0xFF, 0xe6 ^ 0xFF,
+        0x16 ^ 0xFF, 0x96 ^ 0xFF, 0x56 ^ 0xFF, 0xd6 ^ 0xFF, 0x36 ^ 0xFF, 0xb6 ^ 0xFF, 0x76 ^ 0xFF, 0xf6 ^ 0xFF,
+        0x0e ^ 0xFF, 0x8e ^ 0xFF, 0x4e ^ 0xFF, 0xce ^ 0xFF, 0x2e ^ 0xFF, 0xae ^ 0xFF, 0x6e ^ 0xFF, 0xee ^ 0xFF,
+        0x1e ^ 0xFF, 0x9e ^ 0xFF, 0x5e ^ 0xFF, 0xde ^ 0xFF, 0x3e ^ 0xFF, 0xbe ^ 0xFF, 0x7e ^ 0xFF, 0xfe ^ 0xFF,
+        0x01 ^ 0xFF, 0x81 ^ 0xFF, 0x41 ^ 0xFF, 0xc1 ^ 0xFF, 0x21 ^ 0xFF, 0xa1 ^ 0xFF, 0x61 ^ 0xFF, 0xe1 ^ 0xFF,
+        0x11 ^ 0xFF, 0x91 ^ 0xFF, 0x51 ^ 0xFF, 0xd1 ^ 0xFF, 0x31 ^ 0xFF, 0xb1 ^ 0xFF, 0x71 ^ 0xFF, 0xf1 ^ 0xFF,
+        0x09 ^ 0xFF, 0x89 ^ 0xFF, 0x49 ^ 0xFF, 0xc9 ^ 0xFF, 0x29 ^ 0xFF, 0xa9 ^ 0xFF, 0x69 ^ 0xFF, 0xe9 ^ 0xFF,
+        0x19 ^ 0xFF, 0x99 ^ 0xFF, 0x59 ^ 0xFF, 0xd9 ^ 0xFF, 0x39 ^ 0xFF, 0xb9 ^ 0xFF, 0x79 ^ 0xFF, 0xf9 ^ 0xFF,
+        0x05 ^ 0xFF, 0x85 ^ 0xFF, 0x45 ^ 0xFF, 0xc5 ^ 0xFF, 0x25 ^ 0xFF, 0xa5 ^ 0xFF, 0x65 ^ 0xFF, 0xe5 ^ 0xFF,
+        0x15 ^ 0xFF, 0x95 ^ 0xFF, 0x55 ^ 0xFF, 0xd5 ^ 0xFF, 0x35 ^ 0xFF, 0xb5 ^ 0xFF, 0x75 ^ 0xFF, 0xf5 ^ 0xFF,
+        0x0d ^ 0xFF, 0x8d ^ 0xFF, 0x4d ^ 0xFF, 0xcd ^ 0xFF, 0x2d ^ 0xFF, 0xad ^ 0xFF, 0x6d ^ 0xFF, 0xed ^ 0xFF,
+        0x1d ^ 0xFF, 0x9d ^ 0xFF, 0x5d ^ 0xFF, 0xdd ^ 0xFF, 0x3d ^ 0xFF, 0xbd ^ 0xFF, 0x7d ^ 0xFF, 0xfd ^ 0xFF,
+        0x03 ^ 0xFF, 0x83 ^ 0xFF, 0x43 ^ 0xFF, 0xc3 ^ 0xFF, 0x23 ^ 0xFF, 0xa3 ^ 0xFF, 0x63 ^ 0xFF, 0xe3 ^ 0xFF,
+        0x13 ^ 0xFF, 0x93 ^ 0xFF, 0x53 ^ 0xFF, 0xd3 ^ 0xFF, 0x33 ^ 0xFF, 0xb3 ^ 0xFF, 0x73 ^ 0xFF, 0xf3 ^ 0xFF,
+        0x0b ^ 0xFF, 0x8b ^ 0xFF, 0x4b ^ 0xFF, 0xcb ^ 0xFF, 0x2b ^ 0xFF, 0xab ^ 0xFF, 0x6b ^ 0xFF, 0xeb ^ 0xFF,
+        0x1b ^ 0xFF, 0x9b ^ 0xFF, 0x5b ^ 0xFF, 0xdb ^ 0xFF, 0x3b ^ 0xFF, 0xbb ^ 0xFF, 0x7b ^ 0xFF, 0xfb ^ 0xFF,
+        0x07 ^ 0xFF, 0x87 ^ 0xFF, 0x47 ^ 0xFF, 0xc7 ^ 0xFF, 0x27 ^ 0xFF, 0xa7 ^ 0xFF, 0x67 ^ 0xFF, 0xe7 ^ 0xFF,
+        0x17 ^ 0xFF, 0x97 ^ 0xFF, 0x57 ^ 0xFF, 0xd7 ^ 0xFF, 0x37 ^ 0xFF, 0xb7 ^ 0xFF, 0x77 ^ 0xFF, 0xf7 ^ 0xFF,
+        0x0f ^ 0xFF, 0x8f ^ 0xFF, 0x4f ^ 0xFF, 0xcf ^ 0xFF, 0x2f ^ 0xFF, 0xaf ^ 0xFF, 0x6f ^ 0xFF, 0xef ^ 0xFF,
+        0x1f ^ 0xFF, 0x9f ^ 0xFF, 0x5f ^ 0xFF, 0xdf ^ 0xFF, 0x3f ^ 0xFF, 0xbf ^ 0xFF, 0x7f ^ 0xFF, 0xff ^ 0xFF,
+};
 
-/* 3 DMA channels are used.  The first to transfer data to PIO, and
- * the other two to transfer descriptors to the first channel.
- */
-static uint8_t video_dmach_tx;
-static uint8_t video_dmach_descr_cfg;
-static uint8_t video_dmach_descr_data;
+static inline void prepare_scanline(uint y) {
+	static uint8_t scanbuf[FRAME_WIDTH / 8];
+	
+    memset(scanbuf, 0x00, 80);
 
-typedef struct {
-        const void *raddr;
-        void *waddr;
-        uint32_t count;
-        uint32_t ctrl;
-} dma_descr_t;
+    if(fb != NULL && y > FIRST_LINE && y < LAST_LINE)
+    {
+            uint32_t offset = ((y - FIRST_LINE) * STRIDE);
 
-static dma_descr_t video_dmadescr_cfg;
-static dma_descr_t video_dmadescr_data;
+            for(int x = 0; x < STRIDE; x++)
+                    scanbuf[x + 8] = table[fb[offset + x]];
+    }
 
-static volatile unsigned int video_current_y = 0;
-
-static int      __not_in_flash_func(video_get_visible_y)(unsigned int y) {
-        if ((y >= VIDEO_FB_V_VIS_START) && (y < VIDEO_FB_V_VIS_END)) {
-                return y - VIDEO_FB_V_VIS_START;
-        } else {
-                return -1;
-        }
+	uint32_t* tmdsbuf;
+	queue_remove_blocking(&dvi0.q_tmds_free, &tmdsbuf);
+	tmds_encode_1bpp((const uint32_t*)scanbuf, tmdsbuf, FRAME_WIDTH);
+	queue_add_blocking(&dvi0.q_tmds_valid, &tmdsbuf);
 }
 
-static const uint32_t   *__not_in_flash_func(video_line_addr)(unsigned int y)
-{
-        int vy = video_get_visible_y(y);
-        if (vy >= 0)
-                return (const uint32_t *)&video_framebuffer[vy * VIDEO_VISIBLE_WPL];
-        else
-                return (const uint32_t *)video_null;
+void __not_in_flash("scanline_callback")scanline_callback() {
+	static uint y = 0;
+	prepare_scanline(y);
+	y = (y + 1) % FRAME_HEIGHT;
 }
 
-static const uint32_t   *__not_in_flash_func(video_cfg_addr)(unsigned int y)
+void set_framebuffer(uint8_t *framebuffer)
 {
-        return &video_dma_cfg[(y < VIDEO_VSW) ? 0 : 2];
+    fb = framebuffer;
 }
 
-static void    __not_in_flash_func(video_dma_prep_new)()
+void video_init()
 {
-        /* The descriptor DMA read pointers have moved on; reset them.
-         * The write pointers wrap so should be pointing to the
-         * correct DMA regs.
-         */
-        dma_hw->ch[video_dmach_descr_cfg].read_addr = (uintptr_t)&video_dmadescr_cfg;
-        dma_hw->ch[video_dmach_descr_cfg].transfer_count = 4;
-        dma_hw->ch[video_dmach_descr_data].read_addr = (uintptr_t)&video_dmadescr_data;
-        dma_hw->ch[video_dmach_descr_data].transfer_count = 4;
+    //Set overclock
+    vreg_set_voltage(VREG_VSEL);
+	sleep_ms(10);
+	set_sys_clock_khz(DVI_TIMING.bit_clk_khz, true);
 
-        /* Configure the two DMA descriptors, video_dmadescr_cfg and
-         * video_dmadescr_data, to transfer from video config/data corresponding
-         * to the current line.
-         *
-         * These descriptors will be used to program the video_dmach_tx channel,
-         * pushing the buffer to PIO.
-         *
-         * This can be relatively relaxed, as it's triggered as line data
-         * starts; we have until the end of the video line (when the descriptors
-         * are retriggered) to program them.
-         *
-         * FIXME: this time could be used for something clever like split-screen
-         * (e.g. info/text lines) constructed on-the-fly.
-         */
-        video_dmadescr_cfg.raddr = video_cfg_addr(video_current_y);
-        video_dmadescr_data.raddr = video_line_addr(video_current_y);
+    //Init DVI
+    dvi0.timing = &DVI_TIMING;
+	dvi0.ser_cfg = DVI_DEFAULT_SERIAL_CONFIG;
+	dvi0.scanline_callback = scanline_callback;
+	dvi_init(&dvi0, next_striped_spin_lock_num(), next_striped_spin_lock_num());
 
-        /* Frame done */
-        if (++video_current_y >= VIDEO_V_TOTAL)
-                video_current_y = 0;
-}
+    dvi_register_irqs_this_core(&dvi0, DMA_IRQ_0);
 
-static void     __not_in_flash_func(video_dma_irq)()
-{
-        /* The DMA IRQ occurs once the video portion of the line has been
-         * triggered (not when the video transfer completes, but when the
-         * descriptor transfer (that leads to the video transfer!) completes.
-         * All we need to do is reconfigure the descriptors; the video DMA will
-         * re-trigger the descriptors later.
-         */
-        if (dma_channel_get_irq0_status(video_dmach_descr_data)) {
-                dma_channel_acknowledge_irq0(video_dmach_descr_data);
-                video_dma_prep_new();
-        }
-}
+    prepare_scanline(0);
 
-static void     video_prep_buffer()
-{
-        memset(video_null, 0xff, VIDEO_VISIBLE_WPL * 4);
+    hw_set_bits(&bus_ctrl_hw->priority, BUSCTRL_BUS_PRIORITY_PROC0_BITS);
 
-        unsigned int porch_padding = (VIDEO_HRES - VIDEO_FB_HRES)/2;
-        // FIXME: HBP/HFP are prob off by one or so, check
-        uint32_t timing = ((VIDEO_HSW - 1) << 23) |
-                ((VIDEO_HBP + porch_padding - 3) << 15) |
-                ((VIDEO_HFP + porch_padding - 4) << 7);
-        video_dma_cfg[0] = timing | 0x80000000;
-        video_dma_cfg[1] = VIDEO_FB_HRES - 1;
-        video_dma_cfg[2] = timing;
-        video_dma_cfg[3] = VIDEO_FB_HRES - 1;
-}
+	dvi_start(&dvi0);
 
-static void     video_init_dma()
-{
-        /* pio_video expects each display line to be composed of two words of config
-         * describing the line geometry and whether VS is asserted, followed by
-         * visible data.
-         *
-         * To avoid having to embed config metadata in the display framebuffer,
-         * we use two DMA transfers to PIO for each line.  The first transfers
-         * the config from a config buffer, and then triggers the second to
-         * transfer the video data from the framebuffer.  (This lets us use a
-         * flat, regular FB.)
-         *
-         * The PIO side emits 1BPP MSB-first.  The other advantage of
-         * using a second DMA transfer is then we can also can
-         * byteswap the DMA of the video portion to match the Mac
-         * framebuffer layout.
-         *
-         *  "Another caveat is that multiple channels should not be connected
-         *   to the same DREQ.":
-         * The final complexity is that only one DMA channel can do the
-         * transfers to PIO, because of how the credit-based flow control works.
-         * So, _only_ channel 0 transfers from $SOME_BUFFER into the PIO FIFO,
-         * and channel 1+2 are used to reprogram/trigger channel 0 from a DMA
-         * descriptor list.
-         *
-         * Two extra channels are used to manage interrupts; ch1 programs ch0,
-         * completes, and does nothing.  (It programs a descriptor that causes
-         * ch0 to transfer config, then trigger ch2 when complete.)  ch2 then
-         * programs ch0 with a descriptor to transfer data, then trigger ch1
-         * when ch0 completes; when ch2 finishes doing that, it produces an IRQ.
-         * Got that?
-         *
-         * The IRQ handler sets up ch1 and ch2 to point to 2 fresh cfg+data
-         * descriptors; the deadline is by the end of ch0's data transfer
-         * (i.e. a whole line).  When ch0 finishes the data transfer it again
-         * triggers ch1, and the new config entry is programmed.
-         */
-        video_dmach_tx = dma_claim_unused_channel(true);
-        video_dmach_descr_cfg = dma_claim_unused_channel(true);
-        video_dmach_descr_data = dma_claim_unused_channel(true);
-
-        /* Transmit DMA: config+video data */
-        /* First, make dmacfg for data to transfer from config buffers + data buffers: */
-        dma_channel_config dc_tx_c = dma_channel_get_default_config(video_dmach_tx);
-        channel_config_set_dreq(&dc_tx_c, DREQ_PIO0_TX0);
-        channel_config_set_transfer_data_size(&dc_tx_c, DMA_SIZE_32);
-        channel_config_set_read_increment(&dc_tx_c, true);
-        channel_config_set_write_increment(&dc_tx_c, false);
-        channel_config_set_bswap(&dc_tx_c, false);
-        /* Completion of the config TX triggers the video_dmach_descr_data channel */
-        channel_config_set_chain_to(&dc_tx_c, video_dmach_descr_data);
-        video_dmadescr_cfg.raddr = NULL;                /* Reprogrammed each line */
-        video_dmadescr_cfg.waddr = (void *)&pio0_hw->txf[0];
-        video_dmadescr_cfg.count = 2;                   /* 2 words of video config */
-        video_dmadescr_cfg.ctrl = dc_tx_c.ctrl;
-
-        dma_channel_config dc_tx_d = dma_channel_get_default_config(video_dmach_tx);
-        channel_config_set_dreq(&dc_tx_d, DREQ_PIO0_TX0);
-        channel_config_set_transfer_data_size(&dc_tx_d, DMA_SIZE_32);
-        channel_config_set_read_increment(&dc_tx_d, true);
-        channel_config_set_write_increment(&dc_tx_d, false);
-        channel_config_set_bswap(&dc_tx_d, true);      /* This channel bswaps */
-        /* Completion of the data TX triggers the video_dmach_descr_cfg channel */
-        channel_config_set_chain_to(&dc_tx_d, video_dmach_descr_cfg);
-        video_dmadescr_data.raddr = NULL;               /* Reprogrammed each line */
-        video_dmadescr_data.waddr = (void *)&pio0_hw->txf[0];
-        video_dmadescr_data.count = VIDEO_VISIBLE_WPL;
-        video_dmadescr_data.ctrl = dc_tx_d.ctrl;
-
-        /* Now, the descr_cfg and descr_data channels transfer _those_
-         * descriptors to program the video_dmach_tx channel:
-         */
-        dma_channel_config dcfg = dma_channel_get_default_config(video_dmach_descr_cfg);
-        channel_config_set_transfer_data_size(&dcfg, DMA_SIZE_32);
-        channel_config_set_read_increment(&dcfg, true);
-        channel_config_set_write_increment(&dcfg, true);
-        /* This channel loops on 16-byte/4-wprd boundary (i.e. writes all config): */
-        channel_config_set_ring(&dcfg, true, 4);
-        /* No completion IRQ or chain: the video_dmach_tx DMA completes and triggers
-         * the next 'data' descriptor transfer.
-         */
-        dma_channel_configure(video_dmach_descr_cfg, &dcfg,
-                              &dma_hw->ch[video_dmach_tx].read_addr,
-                              &video_dmadescr_cfg,
-                              4 /* 4 words of config */,
-                              false /* Not yet */);
-
-        dma_channel_config ddata = dma_channel_get_default_config(video_dmach_descr_data);
-        channel_config_set_transfer_data_size(&ddata, DMA_SIZE_32);
-        channel_config_set_read_increment(&ddata, true);
-        channel_config_set_write_increment(&ddata, true);
-        channel_config_set_ring(&ddata, true, 4);
-        /* This transfer has a completion IRQ.  Receipt of that means that both
-         * config and data descriptors have been transferred, and should be
-         * reprogrammed for the next line.
-         */
-        dma_channel_set_irq0_enabled(video_dmach_descr_data, true);
-        dma_channel_configure(video_dmach_descr_data, &ddata,
-                              &dma_hw->ch[video_dmach_tx].read_addr,
-                              &video_dmadescr_data,
-                              4 /* 4 words of config */,
-                              false /* Not yet */);
-
-        /* Finally, set up video_dmadescr_cfg.raddr and video_dmadescr_data.raddr to point
-         * to next line's video cfg/data buffers.  Then, video_dmach_descr_cfg can be triggered
-         * to start video.
-         */
-}
-
-////////////////////////////////////////////////////////////////////////////////
-
-/* Initialise PIO, DMA, start sending pixels.  Passed a pointer to a 512x342x1
- * Mac-order framebuffer.
- *
- * FIXME: Add an API to change the FB base after init live, e.g. for bank
- * switching.
- */
-void    video_init(uint32_t *framebuffer)
-{
-        printf("Video init\n");
-
-        pio_video_program_init(pio0, 0,
-                               pio_add_program(pio0, &pio_video_program),
-                               GPIO_VID_DATA, /* Followed by HS, VS, CLK */
-                               VIDEO_PCLK_MULT);
-
-        /* Invert output pins:  HS/VS are active-low, also invert video! */
-        gpio_set_outover(GPIO_VID_HS, GPIO_OVERRIDE_INVERT);
-        gpio_set_outover(GPIO_VID_VS, GPIO_OVERRIDE_INVERT);
-        gpio_set_outover(GPIO_VID_DATA, GPIO_OVERRIDE_INVERT);
-        /* Highest drive strength (VGA is current-based, innit) */
-        hw_write_masked(&padsbank0_hw->io[GPIO_VID_DATA],
-                        PADS_BANK0_GPIO0_DRIVE_VALUE_12MA << PADS_BANK0_GPIO0_DRIVE_LSB,
-                        PADS_BANK0_GPIO0_DRIVE_BITS);
-
-        /* IRQ handlers for DMA_IRQ_0: */
-        irq_set_exclusive_handler(DMA_IRQ_0, video_dma_irq);
-        irq_set_enabled(DMA_IRQ_0, true);
-
-        video_init_dma();
-
-        /* Init config word buffers */
-        video_current_y = 0;
-        video_framebuffer = framebuffer;
-        video_prep_buffer();
-
-        /* Set up pointers to first line, and start DMA */
-        video_dma_prep_new();
-        dma_channel_start(video_dmach_descr_cfg);
 }

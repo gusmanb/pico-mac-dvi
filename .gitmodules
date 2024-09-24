@@ -1,6 +1,9 @@
 [submodule "external/umac"]
 	url = https://github.com/evansm7/umac
 	path = external/umac
-[submodule "external/no-OS-FatFS-SD-SPI-RPi-Pico"]
-	path = external/no-OS-FatFS-SD-SPI-RPi-Pico
-	url = https://github.com/carlk3/no-OS-FatFS-SD-SPI-RPi-Pico.git
+[submodule "external/picodvi"]
+	path = external/picodvi
+	url = https://github.com/Wren6991/PicoDVI
+[submodule "external/picofat"]
+	path = external/picofat
+	url = https://github.com/elehobica/pico_fatfs

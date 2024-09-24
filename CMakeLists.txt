@@ -1,47 +1,47 @@
-# CMakeLists
-#
-# MIT License
-#
-# Copyright (c) 2021, 2024 Matt Evans
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in all
-# copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
-#
-#
+# Generated Cmake Pico project file
+
 cmake_minimum_required(VERSION 3.13)
 
-# Options that should be defined when initialising the build
-# directory with cmake, e.g. "cmake .. -DOPTION=true":
-#
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_VERBOSE_MAKEFILE ON)
 
-option(USE_SD "Build in SD support" OFF)
-set(SD_TX 3 CACHE STRING "SD SPI TX pin")
-set(SD_RX 4 CACHE STRING "SD SPI RX pin")
-set(SD_SCK 2 CACHE STRING "SD SPI SCK pin")
-set(SD_CS 5 CACHE STRING "SD SPI CS pin")
-set(SD_MHZ 5 CACHE STRING "SD SPI speed in MHz")
+#config options
+set(SD_TX 19 CACHE STRING "SD SPI TX pin")
+set(SD_RX 20 CACHE STRING "SD SPI RX pin")
+set(SD_SCK 18 CACHE STRING "SD SPI SCK pin")
+set(SD_CS 21 CACHE STRING "SD SPI CS pin")
+set(SD_MHZ 50 CACHE STRING "SD SPI speed in MHz")
+set(DVI_DEFAULT_SERIAL_CONFIG waveshare_rp2040_pizero)
+
+add_compile_definitions(SD_TX=${SD_TX} SD_RX=${SD_RX} SD_SCK=${SD_SCK} SD_CS=${SD_CS} SD_MHZ=${SD_MHZ} DVI_DEFAULT_SERIAL_CONFIG=${DVI_DEFAULT_SERIAL_CONFIG})
+
+# Initialise pico_sdk from installed location
+# (note this can come from environment, CMake cache etc)
+
+# == DO NEVER EDIT THE NEXT LINES for Raspberry Pi Pico VS Code Extension to work ==
+if(WIN32)
+    set(USERHOME $ENV{USERPROFILE})
+    set(IS_WINDOWS 1)
+else()
+    set(USERHOME $ENV{HOME})
+endif()
+set(sdkVersion 2.0.0)
+set(toolchainVersion 13_2_Rel1)
+set(picotoolVersion 2.0.0)
+set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
+if (EXISTS ${picoVscode})
+    include(${picoVscode})
+endif()
+# ====================================================================================
+set(PICO_BOARD pico CACHE STRING "Board type")
+
+# Pull in Raspberry Pi Pico SDK (must be before project)
+include(pico_sdk_import.cmake)
 
 # See below, -DMEMSIZE=<size in KB> will configure umac's memory size,
 # overriding defaults.
-
-# initialize the SDK based on PICO_SDK_PATH
-# note: this must happen before project()
-include(pico_sdk_import.cmake)
 
 project(firmware)
 
@@ -72,38 +72,54 @@ set(UMAC_SOURCES
   ${UMAC_MUSASHI_PATH}/softfloat/softfloat.c
   )
 
-set(MEMSIZE 128 CACHE STRING "Memory size, in KB")
+set(MEMSIZE 208 CACHE STRING "Memory size, in KB")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -DPICO -DMUSASHI_CNF=\\\"../include/m68kconf.h\\\" -DUMAC_MEMSIZE=${MEMSIZE}")
 
-if (USE_SD)
-   add_compile_definitions(USE_SD=1)
-   set(FF_DISABLE_RTC ${PICO_RP2350})  # RP2350 doesn't have RTC, so disable it
-   add_subdirectory(external/no-OS-FatFS-SD-SPI-RPi-Pico/FatFs_SPI build)
-   set(EXTRA_SD_SRC src/sd_hw_config.c)
-   set(EXTRA_SD_LIB FatFs_SPI)
-   add_compile_definitions(SD_TX=${SD_TX} SD_RX=${SD_RX} SD_SCK=${SD_SCK} SD_CS=${SD_CS} SD_MHZ=${SD_MHZ})
-endif()
+add_compile_definitions(USE_SD=1)
+add_compile_definitions(SD_TX=${SD_TX} SD_RX=${SD_RX} SD_SCK=${SD_SCK} SD_CS=${SD_CS} SD_MHZ=${SD_MHZ})
+add_subdirectory(external/picofat)
+
+# libdvi subproject
+set(LIBDVI_PATH ${CMAKE_CURRENT_SOURCE_DIR}/external/picodvi/software/libdvi)
+set(LIBDVI_INCLUDE_PATHS ${CMAKE_CURRENT_SOURCE_DIR}/external/picodvi/software/include)
+add_subdirectory(${LIBDVI_PATH})
 
 if (TARGET tinyusb_device)
   add_executable(firmware
     src/main.c
-    src/video.c
     src/kbd.c
     src/hid.c
-    ${EXTRA_SD_SRC}
-
+    src/video.c
+    src/menu.c
     ${UMAC_SOURCES}
     )
 
-  # The umac sources need to prepare Musashi (some sources are generated):
-  add_custom_command(OUTPUT ${UMAC_MUSASHI_PATH}/m68kops.c
+  if(IS_WINDOWS)
+    message (WARNING "******umac needs to be built manually under Windows!******")
+  else()
+    # The umac sources need to prepare Musashi (some sources are generated)
+    add_custom_command(OUTPUT ${UMAC_MUSASHI_PATH}/m68kops.c
     COMMAND echo "*** Preparing umac source ***"
     COMMAND make -C ${UMAC_PATH} prepare
     )
+  endif()
+
+  # The umac sources need to prepare Musashi (some sources are generated):
+  #add_custom_command(OUTPUT ${UMAC_MUSASHI_PATH}/m68kops.c
+  #  COMMAND echo "*** Preparing umac source ***"
+  #  COMMAND make -C ${UMAC_PATH} prepare
+  #  )
   add_custom_target(prepare_umac
     DEPENDS ${UMAC_MUSASHI_PATH}/m68kops.c
     )
   add_dependencies(firmware prepare_umac)
+
+  target_compile_definitions(firmware PRIVATE
+	DVI_VERTICAL_REPEAT=1
+	DVI_N_TMDS_BUFFERS=3
+	DVI_MONOCHROME_TMDS
+)
+
 
   target_link_libraries(firmware
     pico_stdlib
@@ -113,7 +129,8 @@ if (TARGET tinyusb_device)
     hardware_dma
     hardware_pio
     hardware_sync
-    ${EXTRA_SD_LIB}
+    libdvi
+    pico_fatfs
     )
 
   target_include_directories(firmware PRIVATE
@@ -121,10 +138,10 @@ if (TARGET tinyusb_device)
     ${TINYUSB_PATH}/hw
     ${TINYUSB_PATH}/src
     ${UMAC_INCLUDE_PATHS}
+    ${LIBDVI_PATH}
+    ${LIBDVI_INCLUDE_PATHS}
     incbin
     )
-
-  pico_generate_pio_header(firmware ${CMAKE_CURRENT_LIST_DIR}/src/pio_video.pio)
 
   pico_enable_stdio_uart(firmware 1)
 
