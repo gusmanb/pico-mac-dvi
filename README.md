@@ -1,4 +1,12 @@
-# Pico Micro Mac (pico-umac)
+# Pico Micro Mac DVI (pico-umac-dvi)
+
+v0.1 September 2024
+
+This is a port of pico-umac to make it work with DVI.
+The project right now is configured for a WaveShare PiZero board
+but can be reconfigured to work with most pico boards with DVI.
+
+## Original README.MD
 
 v0.2 27 August 2024
 
