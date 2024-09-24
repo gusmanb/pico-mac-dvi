@@ -183,6 +183,7 @@ static void     disc_setup(disc_descr_t discs[DISC_NUM_DRIVES])
         /* Look for a disc image */
         DIR di = {0};
         FILINFO fi = {0};
+
         fr = f_findfirst(&di, &fi, "/", disc_pattern);
         if (fr != FR_OK) {
                 goto no_sd;

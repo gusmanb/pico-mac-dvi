@@ -89,7 +89,7 @@ uint8_t process_menu()
 
     switch(val)
     {
-        case MKC_Up:
+        case MKC_Down:
         {
             uint8_t next = selected_entry + 1;
             if(next >= entry_count)
@@ -99,7 +99,7 @@ uint8_t process_menu()
             break;
         }
 
-        case MKC_Down:
+        case MKC_Up:
         {
             uint8_t next = selected_entry - 1;
             if(next >= entry_count)
