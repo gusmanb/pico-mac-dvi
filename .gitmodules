@@ -1,9 +1,9 @@
 [submodule "external/umac"]
-	url = https://github.com/evansm7/umac
+	url = https://github.com/gusmanb/umac
 	path = external/umac
 [submodule "external/picodvi"]
 	path = external/picodvi
-	url = https://github.com/Wren6991/PicoDVI
+	url = https://github.com/gusmanb/PicoDVI
 [submodule "external/picofat"]
 	path = external/picofat
-	url = https://github.com/elehobica/pico_fatfs
+	url = https://github.com/gusmanb/pico_fatfs
