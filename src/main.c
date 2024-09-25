@@ -51,8 +51,8 @@
 // Imports and data
 
 extern void     hid_app_task(void);
-extern int cursor_x;
-extern int cursor_y;
+extern float cursor_x;
+extern float cursor_y;
 extern int cursor_button;
 
 static pico_fatfs_spi_config_t picofat_config =
@@ -88,8 +88,6 @@ static void     poll_led_etc()
         absolute_time_t now = get_absolute_time();
 }
 
-static int umac_cursor_x = 0;
-static int umac_cursor_y = 0;
 static int umac_cursor_button = 0;
 
 static void     poll_umac()
@@ -112,28 +110,13 @@ static void     poll_umac()
                 last_1hz = now;
         }
 
-        int update = 0;
-        int dx = 0;
-        int dy = 0;
-        int b = umac_cursor_button;
-        if (cursor_x != umac_cursor_x) {
-                dx = cursor_x - umac_cursor_x;
-                umac_cursor_x = cursor_x;
-                update = 1;
-        }
-        if (cursor_y != umac_cursor_y) {
-                dy = cursor_y - umac_cursor_y;
-                umac_cursor_y = cursor_y;
-                update = 1;
-        }
-        if (cursor_button != umac_cursor_button) {
-                b = cursor_button;
+       if(cursor_button != umac_cursor_button || (int)cursor_x != 0 || (int)cursor_y != 0)
+       {
+                umac_mouse((int)cursor_x, -(int)cursor_y, cursor_button);
                 umac_cursor_button = cursor_button;
-                update = 1;
-        }
-        if (update) {
-                umac_mouse(dx, -dy, b);
-        }
+                cursor_x -= (int)cursor_x;
+                cursor_y -= (int)cursor_y;
+       }
 
         if (!kbd_queue_empty()) {
                 uint16_t k = kbd_queue_pop();
@@ -170,9 +153,6 @@ static FIL discfp;
 static void     disc_setup(disc_descr_t discs[DISC_NUM_DRIVES])
 {
 
-        char *disc0_name;
-        const char *disc_pattern = "*.img";
-
         /* Mount SD filesystem */
         pico_fatfs_set_config(&picofat_config);
         FRESULT fr = f_mount(&fs, "", 1);
@@ -180,65 +160,23 @@ static void     disc_setup(disc_descr_t discs[DISC_NUM_DRIVES])
                 goto no_sd;
         }
 
-        /* Look for a disc image */
-        DIR di = {0};
-        FILINFO fi = {0};
-
-        fr = f_findfirst(&di, &fi, "/", disc_pattern);
-        if (fr != FR_OK) {
-                goto no_sd;
-        }
-
-        //If we found at least one image, start selector menu
-        init_menu(umac_ram);
-
-        //List all .img files
-        while(fr == FR_OK && fi.fname[0])
+        //Open the file selector
+        init_menu(umac_ram, &fs);
+        while (!process_menu(&discfp))
         {
-                add_menu_entry(fi.fname);
-                fr = f_findnext(&di, &fi);
-        }
-
-        f_closedir(&di);
-
-        uint8_t selected = 0xFF;
-        //Wait for the user to select one
-        while (selected == 0xFF)
-        {
-                selected = process_menu();
                 tuh_task();
                 hid_app_task();
         }
 
-        //Open the selected image 
-        fr = f_findfirst(&di, &fi, "/", disc_pattern);
-        if (fr != FR_OK) {
+        if(discfp.err == 0xFF)
                 goto no_sd;
-        }
 
-        while (selected--)
-        {
-                fr = f_findnext(&di, &fi);
-                if (fr != FR_OK) {
-                        goto no_sd;
-                }
-        }
-        
-        disc0_name = fi.fname;
-        f_closedir(&di);
-
-        /* Open image, set up disc info: */
-        fr = f_open(&discfp, disc0_name, FA_OPEN_EXISTING | FA_READ | FA_WRITE);
-        if (fr != FR_OK && fr != FR_EXIST) {
-                goto no_sd;
-        } else {
-                discs[0].base = 0; // Means use R/W ops
-                discs[0].read_only = false;
-                discs[0].size = f_size(&discfp);
-                discs[0].op_ctx = &discfp;
-                discs[0].op_read = disc_do_read;
-                discs[0].op_write = disc_do_write;
-        }
+        discs[0].base = 0; // Means use R/W ops
+        discs[0].read_only = false;
+        discs[0].size = f_size(&discfp);
+        discs[0].op_ctx = &discfp;
+        discs[0].op_read = disc_do_read;
+        discs[0].op_write = disc_do_write;
 
         return;
 

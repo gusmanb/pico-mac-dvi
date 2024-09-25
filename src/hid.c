@@ -198,8 +198,8 @@ static void process_kbd_report(hid_keyboard_report_t const *report)
 //--------------------------------------------------------------------+
 
 /* Exported for use by other thread! */
-int cursor_x = 0;
-int cursor_y = 0;
+float cursor_x = 0;
+float cursor_y = 0;
 int cursor_button = 0;
 
 #define MAX_DELTA       8
@@ -217,8 +217,8 @@ static void process_mouse_report(hid_mouse_report_t const * report)
         /* report->wheel can be used too... */
 
         cursor_button = !!(report->buttons & MOUSE_BUTTON_LEFT);
-        cursor_x += clamp(report->x);
-        cursor_y += clamp(report->y);
+        cursor_x += report->x / MOUSE_DIVIDER;
+        cursor_y += report->y / MOUSE_DIVIDER;
 }
 
 //--------------------------------------------------------------------+

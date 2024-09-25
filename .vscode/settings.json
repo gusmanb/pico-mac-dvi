@@ -42,6 +42,8 @@
         "compare": "c",
         "cstdint": "c",
         "bus_ctrl.h": "c",
-        "vreg.h": "c"
+        "vreg.h": "c",
+        "tf_card.h": "c",
+        "limits": "c"
     }
 }

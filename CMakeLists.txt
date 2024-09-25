@@ -14,8 +14,9 @@ set(SD_SCK 18 CACHE STRING "SD SPI SCK pin")
 set(SD_CS 21 CACHE STRING "SD SPI CS pin")
 set(SD_MHZ 50 CACHE STRING "SD SPI speed in MHz")
 set(DVI_DEFAULT_SERIAL_CONFIG waveshare_rp2040_pizero)
+set(MOUSE_DIVIDER 4.0f)
 
-add_compile_definitions(SD_TX=${SD_TX} SD_RX=${SD_RX} SD_SCK=${SD_SCK} SD_CS=${SD_CS} SD_MHZ=${SD_MHZ} DVI_DEFAULT_SERIAL_CONFIG=${DVI_DEFAULT_SERIAL_CONFIG})
+add_compile_definitions(SD_TX=${SD_TX} SD_RX=${SD_RX} SD_SCK=${SD_SCK} SD_CS=${SD_CS} SD_MHZ=${SD_MHZ} DVI_DEFAULT_SERIAL_CONFIG=${DVI_DEFAULT_SERIAL_CONFIG} MOUSE_DIVIDER=${MOUSE_DIVIDER})
 
 # Initialise pico_sdk from installed location
 # (note this can come from environment, CMake cache etc)
